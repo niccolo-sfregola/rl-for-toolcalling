@@ -1,13 +1,12 @@
 """
-Ambiente sintetico per il progetto di tool-calling multi-hop con GRPO.
+Synthetic environment for the multi-hop tool-calling project with GRPO.
 
-Genera un piccolo knowledge graph casuale (triple entità-relazione-entità),
-campiona domande a due hop la cui risposta richiede due lookup consecutivi
-nel grafo (l'entità intermedia non viene mai rivelata nella domanda), ed
-espone il tool `lookup` che un agente userà per interrogare il grafo passo
-per passo. Nessun modello linguistico è coinvolto in questo file: è la base
-puramente Python su cui verrà costruito il ciclo agente e il reward
-verificabile.
+Generates a small random knowledge graph (entity-relation-entity triples),
+samples two-hop questions whose answer requires two consecutive lookups
+in the graph (the intermediate entity is never revealed in the question),
+and exposes the `lookup` tool that an agent will use to query the graph step
+by step. No language model is involved in this file: it is the pure Python
+base on which the agent loop and the verifiable reward will be built.
 """
 
 import random as rnd
@@ -15,7 +14,7 @@ import random as rnd
 
 rnd.seed(42)
 
-#definizione del vocabolario
+#vocabulary definition
 
 entities = [
     "Aldoria", "Brevon", "Caldrex", "Dorelia", "Elandor",
@@ -26,18 +25,20 @@ entities = [
 ]
 
 relations = [
-    "alleato_di",
-    "nemico_di",
-    "governato_da",
-    "confina_con"
+    "ally_of",
+    "enemy_of",
+    "governed_by",
+    "borders"
 ]
 
 
+#noun phrases for the tail of (head, relation, tail), given the head:
+#  (Aldoria, governed_by, Brevon) -> Brevon is "the ruler of Aldoria"
 relation_phrases = {
-    "alleato_di" : "è alleato di",
-    "nemico_di" : "è nemico di",
-    "governato_da": "è governato da",
-    "confina_con": "confina con"
+    "ally_of" : "the ally of",
+    "enemy_of" : "the enemy of",
+    "governed_by": "the ruler of",
+    "borders": "the neighbor of"
 
 }
 
@@ -67,10 +68,10 @@ def generate_random_graph(l_dict: int, entities,relations):
     return tuple(tripla), facts_dict
 
 
-#Domande a due hop: scegli a caso un'entità
-#  di partenza h0 e due relazioni r1, r2 tali che
-#  esistano sia (h0, r1) -> h1 che (h1, r2) -> h2.
-#  La domanda è "hop-question" su h0, r1, r2, la gold answer è h2.
+#Two-hop questions: pick a random
+#  starting entity h0 and two relations r1, r2 such that
+#  both (h0, r1) -> h1 and (h1, r2) -> h2 exist.
+#  The question is a "hop-question" on h0, r1, r2, the gold answer is h2.
 
 
 def sample_chain(relations,facts_dict):
@@ -84,34 +85,36 @@ def sample_chain(relations,facts_dict):
         valid_r2 = [r for r in relations if (h1, r) in facts_dict]
         if not valid_r2:
             continue
-        
+
         r2 = rnd.choice(valid_r2)
         h2 = facts_dict[(h1, r2)]
 
     return (h0, r1, r2, h2)
 
 
-#quando il modello chiama il tool di lookup
-#durante il rollout, se sbaglia chiedendo un'entità
-#o una relazine che non esiste, non deve mai
-#  far crashare il rollout
+#when the model calls the lookup tool
+#during the rollout, if it makes a mistake by asking for an entity
+#or a relation that does not exist, it must never
+#  crash the rollout
 
-# dato entità, relazione cerca in facts_dict e ritorna il valore
+# given entity, relation, look it up in facts_dict and return the value
 
 def lookup(entity, relation, facts_dict):
 
     if facts_dict.get((entity, relation)) is None:
-        return None #deve essere dato in pasto al programma per non fermare l'agente in rollout
+        return None #must be fed back to the program so the agent does not stop during rollout
 
     return facts_dict[(entity, relation)]
 
 
 def build_questions(h0, r1, r2, relation_phrases):
-    return f"Chi {relation_phrases[r2]} quello Stato che {relation_phrases[r1]} {h0}?"
+    #read right to left, in the same order as the lookups:
+    #  "Who is the ally of the ruler of Aldoria?" -> (Aldoria, governed_by), then (h1, ally_of)
+    return f"Who is {relation_phrases[r2]} {relation_phrases[r1]} {h0}?"
 
 
 if __name__ == "__main__":
-    #check del funzionamento senza alcun LLM.
+    #check that it works without any LLM.
 
     _,facts_dict = generate_random_graph(40,entities,relations)
     chain_tuple = sample_chain(relations,facts_dict)
