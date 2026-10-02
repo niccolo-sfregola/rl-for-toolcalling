@@ -49,3 +49,47 @@ Log del progetto, una sezione per giornata di lavoro.
 - Fermare la generazione alla prima `</tool_call>` con `stop_strings` (passando `tokenizer=tok` a `generate`).
 - Poi scrivere il ciclo multi-turno completo con `MAX_TURNS`, esecuzione di `lookup`, messaggi `assistant`/`tool` e reward finale.
 - Committare il lavoro di ieri e di oggi.
+
+## 2026-09-25
+
+**Fatto:**
+- `try_model.py`: aggiunto `stop_strings=["</tool_call>"]` (con `tokenizer=tok`) a `generate`. Il modello ora emette una sola tool call per turno, e la seconda chiamata inventata è sparita.
+- System prompt reso **agnostico rispetto alle relazioni**: niente mappa "the ruler of" -> `governed_by`, solo regole generali (usare il tool una chiamata alla volta, risolvere la domanda dall'interno verso l'esterno con un esempio astratto `A`/`B`/`X`, rispondere in `<answer>`, e in caso di errore del tool correggere gli argomenti e richiamarlo invece di chiedere aiuto all'utente). Il prompt è stato spostato in `agent.py` (`SYSTEM_PROMPT`).
+- `lookup` in `dataset_generator.py` ora solleva eccezioni con messaggi informativi, tutti con il prefisso `Error:`:
+  - entità inesistente (`ValueError`), senza elencare le entità valide;
+  - relazione non valida (`ValueError`), con l'elenco delle relazioni valide;
+  - entità e relazione valide ma nessun fatto (`LookupError`).
+- Tolto `rnd.seed(42)` da `dataset_generator.py`: il seed ora lo fissa lo script che usa il modulo.
+- `agent.py`:
+  - `execute_tool_call(call, facts_dict) -> str`: chiama `lookup` dentro un `try/except (ValueError, LookupError)` e restituisce sempre una stringa (l'entità trovata o il messaggio d'errore), così il rollout non crasha mai.
+  - `run_episode(tok, model, facts_dict, question, max_turns, DO_SAMPLE)`: ciclo multi-turno completo. `messages` cresce a ogni turno (assistant con `tool_calls` + tool con il risultato); un turno senza tool call valida (anche malformata) è la risposta finale. Restituisce `(answer, turns_used, messages)`.
+- `try_model.py` riscritto per giocare un episodio intero con `run_episode` e stampare traiettoria, risposta, gold e reward.
+- Primi episodi osservati a mano (seed 42, 123, 1234, 12). Errori tutti diversi fra loro:
+  - nome della relazione copiato dalla domanda (`"neighbor"` invece di `"borders"`);
+  - relazione esterna invece di quella interna;
+  - parola della domanda messa nel campo `entity` (`"entity": "neighbor"`);
+  - entità in minuscolo (`"ravion"`);
+  - stop dopo il primo hop, con l'entità intermedia data come risposta finale;
+  - dopo un errore del tool, resa con richiesta di chiarimenti all'utente (migliorata, ma non risolta, dalla riga nel prompt);
+  - nome copiato male ("Caledrex" invece di "Caldrex") e risposta senza `<answer>`.
+- Scritto `evaluate.py`:
+  - `build_eval_set(n, seed)`: `n` domande, ognuna con il suo grafo, con seed fisso (`EVAL_SEED = 999`) perché l'eval set sia identico prima e dopo il training. Verificata la riproducibilità con `==` su due chiamate.
+  - `episode_stats(messages, answer, gold)`: metriche di un episodio (`has_answer`, `correct`, `n_calls`, `n_ok_lookups`, `two_hops`, `retried`). Testata su una traiettoria scritta a mano.
+  - loop greedy e loop con sampling (G = 8 episodi per domanda, `torch.manual_seed` per riprodurre il campionamento), con `pass@8` e "groups with signal".
+- **Baseline greedy su 30 domande:**
+
+  | metrica | valore |
+  |---|---|
+  | has_answer | 0.13 |
+  | correct | 0.00 |
+  | n_calls | 1.10 |
+  | n_ok_lookups | 0.37 |
+  | two_hops | 0.00 |
+  | retried | 0.03 |
+
+  Il modello quasi sempre fa una sola chiamata e si ferma; circa due chiamate su tre falliscono; non completa mai i due hop.
+
+**Prossimo passo:**
+- Lanciare il loop con sampling e leggere `pass@8`. Stima a priori: tra 0 e 0.15.
+- In base al risultato scegliere come dare segnale a GRPO: curriculum a un hop, SFT di warm-up su traiettorie perfette generate dal grafo, reward di formato, o una combinazione.
+- Aggiungere a `episode_stats` il conteggio per tipo di errore (entità, relazione, fatto inesistente) e la divisione dei risultati per relazione, per verificare l'ipotesi che `ally_of`/`enemy_of` siano più facili.

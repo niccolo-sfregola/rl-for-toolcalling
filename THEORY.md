@@ -108,3 +108,81 @@ GRPO campiona un gruppo di rollout per la stessa domanda e calcola per ciascuno 
 Ne segue che l'RL rinforza comportamenti che il modello a volte produce già, non ne crea di nuovi dal nulla. Rendere il compito fattibile per il modello di partenza (un system prompt chiaro, la mappa esplicita tra parole della domanda e nomi delle relazioni, lo stop dopo una tool call) non è barare: è quello che rende possibile il segnale di apprendimento. Il primo test l'ha mostrato concretamente: senza aiuti il modello sbaglia il nome della relazione (`"neighbor"` invece di `"borders"`) anche con l'`enum` nello schema.
 
 **Prossimo argomento in coda:** il ciclo multi-turno completo e la funzione di reward; poi, prima di GRPO, misurare il tasso di successo del modello base su un centinaio di domande.
+
+## 2026-09-25
+
+### 12. Dove mettere le informazioni: system prompt, schema del tool, messaggi d'errore
+
+Nella sezione 11 si diceva che una mappa esplicita tra parole della domanda e nomi delle relazioni nel system prompt "non è barare". Oggi la scelta è stata rivista: il system prompt è stato reso **agnostico** rispetto alle relazioni. Il motivo è che associare "the ruler of" a `governed_by` è proprio una delle abilità che il modello deve imparare. Se la scriviamo nel prompt, il modello la legge invece di impararla, e il prompt resta legato a queste quattro relazioni.
+
+Una regola pratica per decidere dove va un'informazione:
+- **system prompt**: *come* si lavora nell'ambiente (usare il tool, una chiamata alla volta, l'ordine di risoluzione di una domanda annidata, il formato della risposta, "nessuno risponderà alle tue domande"). Regole generali, che valgono per qualsiasi relazione.
+- **schema del tool**: cosa accetta il tool, come nella documentazione di un'API reale (`enum` sui valori ammessi, eventualmente una `description` per ogni valore). È il posto legittimo dove spiegare le relazioni, se il modello da solo non ce la fa.
+- **messaggi d'errore dell'ambiente**: cosa è andato storto, in modo che il modello possa correggersi. Anche qui c'è un limite: il messaggio non deve rivelare il grafo né offrire scorciatoie. Per questo l'errore sulla relazione elenca le relazioni valide (sono il vocabolario del tool), mentre quello sull'entità **non** elenca le entità: la giusta è già nella domanda, l'elenco non scalerebbe su un grafo grande, e soprattutto darebbe al modello la lista di tutte le risposte possibili, da cui tirare a indovinare.
+
+Il limite di tutto questo è la starvation (sezione 11): un prompt più "puro" rende il task più difficile, e se il modello base non ci riesce mai GRPO non ha segnale. La scelta si verifica con i numeri, non a priori.
+
+Un dettaglio pratico: conviene che tutti gli errori dell'ambiente abbiano un formato uniforme (qui il prefisso `Error:`). Semplifica sia il codice che li riconosce (`content.startswith("Error")`) sia quello che il modello deve imparare a riconoscere.
+
+### 13. Il modello non ha memoria: la storia dei messaggi cresce sempre
+
+Tra una chiamata a `generate` e la successiva il modello non ricorda niente. Ogni volta vede solo il prompt che gli viene passato, e `apply_chat_template(messages)` trasforma l'intera lista in un unico testo. Per questo `messages` può solo crescere:
+
+```
+turno 0:  [system, user]
+turno 1:  [system, user, assistant(call 1), tool(risultato 1)]
+turno 2:  [system, user, assistant(call 1), tool(risultato 1), assistant(call 2), tool(risultato 2)]
+```
+
+Se si tolgono i messaggi iniziali, al secondo turno il modello riceve un'entità senza sapere a quale domanda si riferisce. La stessa lista è anche la **traiettoria** che GRPO userà per il training: il reward valuta l'episodio intero.
+
+### 14. Seed e riproducibilità
+
+- `random.seed(s)` fissa il generatore del modulo `random` di Python, che è **unico per tutto il processo**: vale anche per i moduli importati (qui `dataset_generator`). Conviene fissarlo nello script che lancia l'esperimento, vicino al punto in cui serve, e non dentro un modulo di libreria al momento dell'import. L'alternativa più robusta è un generatore dedicato (`rng = random.Random(s)`) passato come parametro.
+- Il campionamento dei token passa invece da **PyTorch**, che ha un generatore suo: `random.seed` fissa il grafo e la domanda, ma non la traiettoria con `do_sample=True`. Per riprodurre anche quella serve `torch.manual_seed(s)`.
+- L'**eval set** deve essere identico prima e dopo il training, altrimenti non si può distinguere un modello migliorato da domande più facili. E il suo seed deve essere diverso da quelli di training, perché il modello non si alleni sulle domande su cui viene valutato.
+
+### 15. Greedy, sampling e temperatura
+
+A ogni passo il modello produce una **distribuzione di probabilità** su tutto il vocabolario (circa 150.000 token per Qwen). Per esempio, dopo `"relation": "` potrebbe dare `"neighbor"` 0.55, `"borders"` 0.30, `"ally_of"` 0.10. Da questa distribuzione va estratto un token:
+
+- **greedy** (`do_sample=False`): sempre il più probabile, qui `"neighbor"`. È deterministico, utile per il debug e per misurare il comportamento "preferito" del modello. Il 30% su `"borders"`, che sarebbe la risposta giusta, non esce mai.
+- **sampling** (`do_sample=True`): si estrae secondo le probabilità, quindi `"borders"` esce circa il 30% delle volte. Ogni esecuzione dà una traiettoria diversa.
+- **temperature** `T`: prima dell'estrazione i logit vengono divisi per `T`. Con `T < 1` la distribuzione si appuntisce (più vicina al greedy), con `T > 1` si appiattisce (più varia, ma più caotica), con `T -> 0` coincide con il greedy.
+
+In training si usa sempre il sampling: è l'**esplorazione** dell'RL. Senza variabilità fra le traiettorie non c'è niente da confrontare.
+
+### 16. pass@G e "groups with signal"
+
+**pass@G**: per ogni domanda si fanno G episodi con sampling; la domanda è risolta se **almeno uno** ha reward 1. pass@G è la frazione di domande risolte. Con 30 domande e G = 8, se in 3 domande almeno un episodio su 8 è corretto, pass@8 = 0.10. Può essere maggiore di zero anche quando l'accuracy greedy è 0.
+
+Se un singolo episodio ha probabilità `p` di successo e gli episodi sono indipendenti:
+
+```
+pass@G = 1 - (1 - p)^G        p = 0.01, G = 8  ->  circa 0.08
+```
+
+Il legame con GRPO: il vantaggio di ogni traiettoria è `(r_i - media del gruppo) / std del gruppo`. Un gruppo con reward tutte 0, oppure tutte 1, ha vantaggi tutti nulli e non produce gradiente. La metrica che conta davvero è quindi la frazione di domande con **alcuni** episodi corretti ma **non tutti** (`0 < k < G`), chiamata qui "groups with signal". Con un modello base quasi sempre sbagliato coincide con pass@G. Dopo il training, quando alcune domande avranno gruppi tutti corretti, le due metriche divergono.
+
+In sintesi: il greedy misura cosa fa il modello adesso, il pass@G con sampling misura cosa **può** imparare. **GRPO non crea il segnale da zero**: amplifica successi che il modello già produce ogni tanto. Se pass@G è 0, far partire il training non serve, bisogna prima rendere il task raggiungibile.
+
+### 17. Errori tipici di un modello piccolo in un task agentico multi-hop
+
+Dagli episodi di oggi (Qwen2.5-0.5B-Instruct, senza training):
+
+- **Copiare invece di mappare**: scrive nel JSON la parola della domanda (`"neighbor"`) invece del nome della relazione (`"borders"`), o la mette nel campo sbagliato (`"entity": "neighbor"`). Quando la parola della domanda è contenuta nel nome della relazione ("ally" in `ally_of`) la chiamata tende a essere giusta: la difficoltà del task dipende dalla relazione, e una reward media può salire solo perché il modello migliora sulle relazioni facili.
+- **Fermarsi al primo hop**: riceve l'entità intermedia e la dà come risposta ("The neighbor of the ally of Lunara is Quendria"). La frase suona plausibile, ma è sbagliata. È l'errore classico del multi-hop, ed è proprio l'abilità di ragionamento che il training deve insegnare.
+- **Arrendersi all'utente dopo un errore del tool**: "Could you please provide more details?". Il motivo è nel formato di Qwen2.5 (sezione 5): la risposta del tool viene messa in un turno `user`, quindi per il modello è l'utente che gli segnala l'errore, e un modello Instruct risponde all'utente in modo cortese invece di correggere la chiamata. Una riga generica nel system prompt ("se il tool restituisce un errore, correggi gli argomenti e richiamalo; nessuno risponderà") lo ha fatto riprovare, ma cambiando anche l'argomento che era già giusto: tira a indovinare più che ragionare sull'errore.
+- **Errori di formato e di copia**: risposta senza `<answer>`, oppure nome copiato male ("Caledrex" per "Caldrex"). Il nome inventato viene spezzato dal tokenizer in pezzi poco comuni, e il modello li ricompone male. Con un confronto esatto, anche la catena giusta prende reward 0.
+
+Conviene tenere separati gli errori di **formato** (facili da imparare, eventualmente con una piccola reward dedicata) da quelli di **ragionamento** (il vero obiettivo, che deve restare nella reward principale). Una reward di formato va però usata con cautela: il modello può imparare a raccoglierla senza risolvere il task (reward hacking).
+
+### 18. Come dare segnale a GRPO quando la baseline è a zero
+
+Opzioni, dalla più "pura" alla più efficace:
+1. **Curriculum**: partire da domande a un hop, dove il modello ha già un tasso di successo non nullo, e passare ai due hop quando la reward sale.
+2. **Reward shaping**: reward parziali (formato, primo lookup corretto). Con il rischio di reward hacking visto sopra.
+3. **SFT di warm-up (cold start)**: poiché la catena gold è nota, si possono generare in automatico traiettorie perfette e fare un breve fine-tuning supervisionato prima dell'RL. È l'approccio usato anche in DeepSeek-R1.
+4. **Modello più grande**: più capacità di partenza, ma con 6 GB di VRAM il training richiederebbe tecniche come LoRA.
+
+**Prossimo argomento in coda:** leggere pass@8 e scegliere fra queste opzioni; poi la struttura della loss di GRPO e il mascheramento dei token non generati dal modello (le risposte dei tool).
