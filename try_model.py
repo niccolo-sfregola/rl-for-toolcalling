@@ -32,7 +32,7 @@ if __name__ == "__main__":
     print("QUESTION:", question)
     print("CHAIN:   ", " -> ".join(f"{e} --{r}" for e, r in zip(path, rels)), "->", gold)
 
-    answer, turns_used, messages = run_episode(
+    answer, turns_used, messages, token_ids, completion_mask = run_episode(
         tok, model, facts_dict, question, max_turns=MAX_TURNS, DO_SAMPLE=DO_SAMPLE
     )
 
@@ -46,3 +46,13 @@ if __name__ == "__main__":
 
     reward = compute_reward(messages, answer, gold, path[0])
     print("\nANSWER:", answer, "| GOLD:", gold.lower(), "| TURNS:", turns_used, "| REWARD:", reward)
+
+    #token check: the sequence the model saw and generated, from its first generated token
+    #  (the system prompt with the # Tools block is long and comes from the template as is)
+    first_gen = completion_mask.nonzero()[0].item()
+    print("\nTOKENS FROM THE FIRST GENERATION:")
+    print(tok.decode(token_ids[first_gen:]))
+
+    #only the tokens that get gradient: the model's own text, no prompt and no tool response
+    print("\nMASKED TOKENS (completion_mask == 1):")
+    print(tok.decode(token_ids[completion_mask == 1]))

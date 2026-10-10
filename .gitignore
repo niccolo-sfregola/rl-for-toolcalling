@@ -1,3 +1,7 @@
 .venv
 __pycache__
 *.pyc
+THEORY.md
+PROGRESS.md
+eval_1hop_sampling.log
+checkpoints/
