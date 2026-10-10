@@ -97,7 +97,7 @@ if __name__ == "__main__":
         failures = []   #trajectories of wrong episodes
 
         for i, item in enumerate(eval_set):
-            answer, turns_used, messages = run_episode(
+            answer, turns_used, messages, _, _ = run_episode(
                 tok, model, item["facts_dict"], item["question"],
                 max_turns=MAX_TURNS, DO_SAMPLE=False,
             )
@@ -124,7 +124,7 @@ if __name__ == "__main__":
         n_correct = 0
         rewards = []
         for g in range(G):
-            answer, turns_used, messages = run_episode(
+            answer, turns_used, messages, _, _ = run_episode(
                 tok, model, item["facts_dict"], item["question"],
                 max_turns=MAX_TURNS, DO_SAMPLE=True,
             )

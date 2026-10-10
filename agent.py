@@ -140,12 +140,32 @@ def parse_answer(text: str) -> str | None:
     return answer
 
 
-def run_episode(tok, model, facts_dict, question, max_turns, DO_SAMPLE):
-    """Run one multi-turn episode on a question. Returns (answer, turns_used, messages):
-    answer is the normalized content of <answer>, or None if the model never gave one."""
+def tool_turn_tokens(tok, messages):
+    """Token ids that the chat template puts between the end of the last assistant
+    generation and the start of the next one: <|im_end|> closing the assistant turn,
+    the tool response wrapped as a user turn, and the new assistant header.
+    messages must end with the assistant tool call and its tool response."""
 
-    #the model has no memory between generate calls: the whole history
-    #  is re-rendered by the chat template at every turn, so messages only grows
+    #render up to the assistant header of the tool call turn, then the whole history:
+    #  the difference is the re-serialized tool call (skipped, the model generated its own
+    #  version) followed by everything up to the next generation prompt
+    before = tok.apply_chat_template(messages[:-2], tools=[lookup_dict],
+                                     add_generation_prompt=True, tokenize=False)
+    full = tok.apply_chat_template(messages, tools=[lookup_dict],
+                                   add_generation_prompt=True, tokenize=False)
+    rest = full[len(before):]
+    suffix = rest[rest.index("<|im_end|>"):]
+
+    return tok(suffix, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
+
+
+def run_episode(tok, model, facts_dict, question, max_turns, DO_SAMPLE):
+    """Run one multi-turn episode on a question.
+    Returns (answer, turns_used, messages, token_ids, completion_mask):
+    answer is the normalized content of <answer>, or None if the model never gave one;
+    token_ids is the whole episode exactly as the model saw and generated it (1D, on cpu),
+    completion_mask has 1 on the generated tokens and 0 on prompt and tool tokens."""
+
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": question},
@@ -153,20 +173,26 @@ def run_episode(tok, model, facts_dict, question, max_turns, DO_SAMPLE):
     answer = None
     turns_used = 0
 
+    #the chat template is rendered only once, for the first prompt. After that the
+    #  sequence grows with the generated tokens and the tool tokens: re-rendering messages
+    #  would re-serialize the tool calls, and the model would be trained on tokens
+    #  different from the ones it sampled
+    ids = tok.apply_chat_template(
+        messages,
+        tools=[lookup_dict],
+        add_generation_prompt=True,
+        return_tensors="pt",
+        return_dict=True,
+    )["input_ids"].to("cuda")
+    mask = [0] * ids.shape[1]
+
     for turn in range(max_turns):
         turns_used = turn + 1
 
-        inputs = tok.apply_chat_template(
-            messages,
-            tools=[lookup_dict],
-            add_generation_prompt=True,
-            return_tensors="pt",
-            return_dict=True,
-        ).to("cuda")
-
         with torch.no_grad():
             out = model.generate(
-                **inputs,
+                input_ids=ids,
+                attention_mask=torch.ones_like(ids),
                 max_new_tokens=256,
                 do_sample=DO_SAMPLE,
                 temperature=TEMPERATURE if DO_SAMPLE else None,
@@ -175,7 +201,9 @@ def run_episode(tok, model, facts_dict, question, max_turns, DO_SAMPLE):
                 tokenizer=tok,
             )
 
-        new_tokens = out[0, inputs["input_ids"].shape[1]:]
+        new_tokens = out[0, ids.shape[1]:]
+        ids = out
+        mask += [1] * len(new_tokens)
         text = tok.decode(new_tokens, skip_special_tokens=True)
 
         call_dict = parse_tool_call(text)
@@ -196,7 +224,11 @@ def run_episode(tok, model, facts_dict, question, max_turns, DO_SAMPLE):
         reminder = ERROR_REMINDER if result.startswith("Error") else RESULT_REMINDER
         messages.append({"role": "tool", "content": f"{result}\n{reminder}"})
 
-    return answer, turns_used, messages
+        tool_ids = tool_turn_tokens(tok, messages).to("cuda")
+        ids = torch.cat([ids, tool_ids.unsqueeze(0)], dim=1)
+        mask += [0] * len(tool_ids)
+
+    return answer, turns_used, messages, ids[0].cpu(), torch.tensor(mask)
 
 
 def compute_reward(messages, answer, gold, h0) -> float:
