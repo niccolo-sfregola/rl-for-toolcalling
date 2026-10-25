@@ -2,6 +2,8 @@ import os
 import random as rnd
 
 import torch
+from peft import (LoraConfig, TaskType, get_peft_model,
+                  get_peft_model_state_dict, set_peft_model_state_dict)
 
 from dataset_generator import (build_questions, generate_random_graph,
                                entities, relations, relation_phrases, sample_chain)
@@ -20,18 +22,18 @@ MAX_TURNS = 6
 #  clip-higher is left out: one optimizer step per batch of rollouts, the ratio is always 1
 #  and the clip never triggers. Overlong shaping too: episodes are short, and the ones
 #  that reach MAX_TURNS already get 0
-G = 8                     #episodes per question (group size)
+G = 8                    #episodes per question (group size)
 N_GROUPS_PER_STEP = 4     #groups with signal per optimizer step
 MAX_QUESTIONS_PER_STEP = 32   #cap on the questions sampled in one step, against endless loops
 N_STEPS = 200
-LR = 1e-6
+LR = 4e-5
 EPS = 1e-4                #in the advantage denominator, against std close to 0
 
 EVAL_EVERY = 25           #steps between two evaluations
 N_EVAL_QUESTIONS = 30
-CHECKPOINT_DIR = "checkpoints/fp32_run"
-SAVE_EVERY = 10           #steps between two saves of the full training state
-RESUME_FROM = None        #path of a train_state.pt to resume from, None to start from scratch
+CHECKPOINT_DIR = "checkpoints/lora_r16"
+SAVE_EVERY = 10          #steps between two saves of the full training state
+RESUME_FROM = None       #path of a train_state.pt to resume from, None to start from scratch
 
 
 
@@ -130,7 +132,8 @@ def n_model_tokens(episode) -> int:
 
 
 def save_train_state(path, step, model, optimizer, eval_history):
-    """Everything needed to resume exactly from this step: weights, AdamW state,
+    """Everything needed to resume exactly from this step: LoRA adapter weights
+    (the base model is frozen, it never changes), AdamW state,
     the random states (questions come from rnd, token sampling from torch) and the evals.
     Written to a temporary file and then renamed: a crash while saving
     does not destroy the previous state."""
@@ -138,7 +141,7 @@ def save_train_state(path, step, model, optimizer, eval_history):
     tmp = path + ".tmp"
     torch.save({
         "step": step,
-        "model": model.state_dict(),
+        "model": get_peft_model_state_dict(model),
         "optimizer": optimizer.state_dict(),
         "rnd_state": rnd.getstate(),
         "torch_rng": torch.get_rng_state(),
@@ -170,10 +173,30 @@ def evaluate(tok, model, eval_set):
 if __name__ == "__main__":
     tok, model = load_model()
 
-    #float32 weights: in bfloat16 an update of ~LR is smaller than the gap between two
-    #  representable values of a typical weight (~1e-4 around 0.02), and gets rounded away.
-    #  The computations still run in bfloat16 through autocast, so speed barely changes
-    model.float()
+    #LoRA (Low-Rank Adaptation): the original weights W stay frozen in bfloat16, only a
+    #  low-rank update dW = B @ A (scaled by alpha / r) is trained on every target layer.
+    #  The adapters are float32, so updates of ~LR are not rounded away as they would be
+    #  on bfloat16 weights, and gradients plus AdamW state only exist for ~9M parameters:
+    #  full fine-tuning in float32 needs ~8 GB, more than the 6 GB of the GPU
+    lora_config = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        task_type=TaskType.CAUSAL_LM,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_dropout=0,
+    )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
+
+    #check: the adapters must be float32, the frozen base model bfloat16
+    trainable_dtypes = set()
+    frozen_dtypes = set()
+    for _, param in model.named_parameters():
+        if param.requires_grad:
+            trainable_dtypes.add(param.dtype)
+        else:
+            frozen_dtypes.add(param.dtype)
+    print(f"trainable: {trainable_dtypes} | frozen: {frozen_dtypes}")
 
     eval_set = build_eval_set(N_EVAL_QUESTIONS, EVAL_SEED, N_HOPS)
 
@@ -181,13 +204,16 @@ if __name__ == "__main__":
     rnd.seed(TRAIN_SEED)
     torch.manual_seed(TRAIN_SEED)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+    #only the adapters: AdamW keeps no state for the frozen weights, and the clip
+    #  works on the same set of parameters
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=LR)
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     state_path = f"{CHECKPOINT_DIR}/train_state.pt"
 
     if RESUME_FROM is not None:
         state = torch.load(RESUME_FROM, map_location="cuda", weights_only=False)
-        model.load_state_dict(state["model"])
+        set_peft_model_state_dict(model, state["model"])
         optimizer.load_state_dict(state["optimizer"])
         rnd.setstate(state["rnd_state"])
         torch.set_rng_state(state["torch_rng"].cpu())
@@ -242,7 +268,7 @@ if __name__ == "__main__":
 
         if kept:
             #a single bad batch must not move the weights too far
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             optimizer.step()
 
         #log: mean reward and has_answer over every sampled episode,
@@ -254,19 +280,20 @@ if __name__ == "__main__":
               f"groups with signal {n_kept_groups}/{n_questions} ({with_signal:.2f}) | "
               f"tokens {n_tokens} | loss {total_loss:+.4f}")
 
-        #every EVAL_EVERY steps: evaluate and save the weights in bfloat16 (half the disk),
-        #  enough to load them for inference with from_pretrained
+        #every EVAL_EVERY steps: evaluate and save the adapters (save_pretrained on a
+        #  PeftModel writes only them, a few tens of MB), to load later with
+        #  PeftModel.from_pretrained on top of the base model
         if step % EVAL_EVERY == 0:
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 eval_history.append((step, evaluate(tok, model, eval_set)))
-            bf16_weights = {k: v.to(torch.bfloat16) for k, v in model.state_dict().items()}
-            model.save_pretrained(f"{CHECKPOINT_DIR}/step_{step}", state_dict=bf16_weights)
+            model.save_pretrained(f"{CHECKPOINT_DIR}/step_{step}")
             tok.save_pretrained(f"{CHECKPOINT_DIR}/step_{step}")
-            del bf16_weights
 
         #every SAVE_EVERY steps: full training state, overwritten, to resume after a crash
         if step % SAVE_EVERY == 0:
             save_train_state(state_path, step, model, optimizer, eval_history)
+
+        print(torch.cuda.max_memory_allocated() / 1e9)
 
     print("\nEVAL HISTORY (step, correct, reward, has_answer)")
     for step, means in eval_history:

@@ -37,6 +37,7 @@ nvidia-nvjitlink==13.4.92
 nvidia-nvshmem-cu13==3.4.5
 nvidia-nvtx==13.0.85
 packaging==26.3
+peft==0.21.2
 psutil==7.2.2
 Pygments==2.21.0
 PyYAML==6.0.3
